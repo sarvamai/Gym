@@ -1,0 +1,57 @@
+harbor_agent:
+  responses_api_agents:
+    harbor_agent:
+      entrypoint: app.py
+      domain: agent
+      description: Harbor integration for OpenSWE on a self-hosted E2B (e2b.sarvam.ai).
+      value: Evaluate open-source SWE agents through Harbor using E2B sandboxes.
+      concurrency: 10
+
+      # Local OpenSWE task tree (patched: Dockerfiles use `RUN git clone` instead of
+      # `COPY repo /testbed`). The raw archive at data/openswe/tasks/* doesn't ship the
+      # `repo/` build-context dir, so the unpatched Dockerfiles fail to build.
+      # `openswe_harbor_filtered_20/patched_tasks/openswe_oss` is a seed=42 sample of 20
+      # filtered+base_image_published tasks produced by scripts/build_openswe_oss_filtered_20.py.
+      # Instance_ids in the input JSONL use "<alias>::<task_name>".
+      harbor_datasets:
+        openswe_oss:
+          local_dataset_path: "responses_api_agents/harbor_agent/data/openswe_harbor_filtered_20/patched_tasks/openswe_oss"
+          workdir: "/testbed"
+        openswe_other:
+          local_dataset_path: "responses_api_agents/harbor_agent/data/openswe_harbor_filtered_10/patched_modal_tasks/openswe_other"
+          workdir: "/testbed"
+
+      # Mini SWE-agent harness — far lighter than OpenHands (no 315-pkg uv
+      # install that exhausts the e2b sandbox disk). Use the local Fireworks
+      # compat wrapper that strips message["extra"] for OpenAI-compatible
+      # endpoints.
+      harbor_agent_name: "mini-swe-agent"
+      harbor_agent_import_path: "responses_api_agents.harbor_agent.custom_agents.mini_swe_agent_fireworks_compat:MiniSweAgentFireworksCompat"
+      harbor_agent_kwargs:
+        api_base: ${policy_base_url}
+
+      # E2B environment backend (self-hosted at e2b.sarvam.ai via env vars).
+      # E2B_DOMAIN and E2B_API_KEY must be exported in the process environment;
+      # the e2b SDK reads them directly (see e2b/connection_config.py).
+      #
+      # Use the local-context subclass: stock Harbor E2BEnvironment instantiates
+      # Template() without file_context_path, so COPY paths inside a task's
+      # Dockerfile resolve from site-packages/harbor/environments/ and fail.
+      # The override passes file_context_path=self.environment_dir.
+      harbor_environment_type: null
+      harbor_environment_import_path: "responses_api_agents.harbor_agent.custom_envs.e2b_local_context.e2b_local_context:E2BLocalContextEnvironment"
+      harbor_environment_kwargs:
+        # Self-hosted e2b.sarvam.ai rejects sandbox_timeout >= 3600 with
+        # "400: Timeout cannot be greater than 1 hours". Stay just under.
+        sandbox_timeout: 3500
+
+      model_server:
+        type: responses_api_models
+        name: policy_model
+
+      harbor_agent_override_timeout: null
+      harbor_agent_max_timeout: 3600
+      harbor_verifier_override_timeout: null
+      harbor_verifier_max_timeout: 900
+      harbor_timeout_multiplier: null
+      harbor_jobs_dir: "responses_api_agents/harbor_agent/jobs"

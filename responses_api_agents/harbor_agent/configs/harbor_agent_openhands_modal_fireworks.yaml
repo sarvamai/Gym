@@ -1,0 +1,43 @@
+harbor_agent:
+  responses_api_agents:
+    harbor_agent:
+      # Python module entrypoint loaded by NeMo Gym.
+      entrypoint: app.py
+      domain: agent
+      description: Harbor integration for OpenHands on SWE-bench Verified with Modal.
+      value: Evaluate open-source SWE agents through Harbor using Modal sandboxes.
+      concurrency: 1
+
+      harbor_datasets:
+        swe_verified:
+          dataset_name: "swebench-verified"
+          dataset_version: null
+          workdir: "/testbed"
+
+      # Harbor OpenHands harness. Pin OpenHands because newer 1.x releases
+      # removed or broke the legacy headless path used by Harbor, and use a
+      # local wrapper so LiteLLM treats the policy server as OpenAI-compatible.
+      harbor_agent_name: "openhands"
+      harbor_agent_import_path: "responses_api_agents.harbor_agent.custom_agents.openhands_litellm_compat:OpenHandsLiteLLMCompat"
+      harbor_agent_kwargs:
+        max_turns: 100
+        version: "0.57.2"
+        api_base: ${policy_base_url}
+
+      # Built-in Harbor Modal environment. Import path must be null or it overrides type.
+      harbor_environment_type: "modal"
+      harbor_environment_import_path: null
+      harbor_environment_kwargs: {}
+
+      # Model routing: OpenHands calls the NeMo Gym policy_model server, which
+      # is configured with Fireworks' OpenAI-compatible endpoint in this smoke run.
+      model_server:
+        type: responses_api_models
+        name: policy_model
+
+      harbor_agent_override_timeout: null
+      harbor_agent_max_timeout: 3600
+      harbor_verifier_override_timeout: null
+      harbor_verifier_max_timeout: 900
+      harbor_timeout_multiplier: null
+      harbor_jobs_dir: "responses_api_agents/harbor_agent/jobs"

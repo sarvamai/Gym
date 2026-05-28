@@ -217,8 +217,16 @@ class HarborAgent(SimpleResponsesAPIAgent):
             instance_id = body.instance_id
             dataset_alias, task_name = self._parse_instance_id(instance_id)
 
-            output_file_dir = self._get_results_output_dir(policy_model_name, dataset_alias, run_timestamp)
-            jobs_dir = self._get_jobs_output_dir(policy_model_name, dataset_alias, run_timestamp)
+            output_file_dir = self._get_results_output_dir(
+                policy_model_name,
+                dataset_alias,
+                run_timestamp,
+            )
+            jobs_dir = self._get_jobs_output_dir(
+                policy_model_name,
+                dataset_alias,
+                run_timestamp,
+            )
             job_name = self._build_job_name(run_id)
 
             responses_create_params = body.responses_create_params.model_dump(
@@ -236,6 +244,14 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 responses_create_params=responses_create_params,
             )
 
+            trial_result = None
+            trajectory = None
+            agent_error_flags = {}
+            output_items = []
+            input_messages = []
+            usage = None
+            reward = 0.0
+
             try:
                 params = dict(
                     job_config_dict=job_config_dict,
@@ -244,47 +260,32 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 trial_dir_path = await asyncio.to_thread(ray.get, future)
                 trial_dir = Path(trial_dir_path)
 
-                # Read the trial result (summary: reward, agent_result, verifier_result)
-                with open(trial_dir / "result.json", "r") as f:
-                    trial_result = json.load(f)
-
-                # Read the ATIF trajectory (full conversation with per-token logprobs)
-                trajectory = None
-                trajectory_path = trial_dir / "agent" / "trajectory.json"
-                if trajectory_path.exists():
-                    with open(trajectory_path, "r") as f:
-                        trajectory = json.load(f)
-
-                # Read agent error flags written by the agent
-                agent_error_flags = {}
-                agent_error_flags_path = trial_dir / "agent" / "agent_error_flags.json"
-                if agent_error_flags_path.exists():
-                    with open(agent_error_flags_path, "r") as f:
-                        agent_error_flags = json.load(f)
-
-                # Extract reward from verifier result
-                verifier_result = trial_result.get("verifier_result")
-                reward = HarborAgentUtils.extract_reward(verifier_result)
-
-                # Convert Harbor outputs to NeMo Gym response items:
-                # keep rich trajectory details, then overlay rollout token details when present.
-                output_items = HarborAgentUtils.trial_result_to_responses(trial_result, trajectory)
-
-                # Extract the initial instruction from the trajectory as input messages
-                input_messages = HarborAgentUtils.extract_input_from_trajectory(trajectory)
-
-                # Populate usage from trajectory final_metrics or agent_result
-                usage = HarborAgentUtils.extract_usage(trial_result, trajectory)
+                (
+                    trial_result,
+                    trajectory,
+                    agent_error_flags,
+                    output_items,
+                    input_messages,
+                    usage,
+                    reward,
+                ) = self._read_trial_outputs(trial_dir)
 
             except Exception as e:
                 print(f"Error running Harbor job: {e}")
-                trial_result = None
-                trajectory = None
-                agent_error_flags = {}
-                output_items = []
-                input_messages = []
-                usage = None
-                reward = 0.0
+                recovered_trial_dir = self._recover_trial_dir(jobs_dir, job_name)
+                if recovered_trial_dir is not None:
+                    try:
+                        (
+                            trial_result,
+                            trajectory,
+                            agent_error_flags,
+                            output_items,
+                            input_messages,
+                            usage,
+                            reward,
+                        ) = self._read_trial_outputs(recovered_trial_dir)
+                    except Exception as recovery_error:
+                        print(f"Error recovering Harbor trial artifacts: {recovery_error}")
 
             response = HarborAgentUtils.get_default_response_object()
             response["model"] = policy_model_name
@@ -322,19 +323,70 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
             return verify_response
 
+    def _read_trial_outputs(
+        self,
+        trial_dir: Path,
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[Any], Optional[dict[str, Any]], float]:
+        """Read Harbor trial artifacts and convert them to NeMo Gym response fields."""
+        with open(trial_dir / "result.json", "r") as f:
+            trial_result = json.load(f)
+
+        trajectory = None
+        trajectory_path = trial_dir / "agent" / "trajectory.json"
+        if trajectory_path.exists():
+            with open(trajectory_path, "r") as f:
+                trajectory = json.load(f)
+
+        agent_error_flags = {}
+        agent_error_flags_path = trial_dir / "agent" / "agent_error_flags.json"
+        if agent_error_flags_path.exists():
+            with open(agent_error_flags_path, "r") as f:
+                agent_error_flags = json.load(f)
+
+        verifier_result = trial_result.get("verifier_result")
+        reward = HarborAgentUtils.extract_reward(verifier_result)
+        output_items = HarborAgentUtils.trial_result_to_responses(trial_result, trajectory)
+        input_messages = HarborAgentUtils.extract_input_from_trajectory(trajectory)
+        usage = HarborAgentUtils.extract_usage(trial_result, trajectory)
+
+        return trial_result, trajectory, agent_error_flags, output_items, input_messages, usage, reward
+
+    def _recover_trial_dir(self, jobs_dir: Path, job_name: str) -> Optional[Path]:
+        """Recover a completed trial directory when the Ray task raises after writing artifacts."""
+        job_dir = jobs_dir / job_name
+        if not job_dir.exists():
+            return None
+
+        for trial_dir in job_dir.iterdir():
+            if not trial_dir.is_dir():
+                continue
+            result_path = trial_dir / "result.json"
+            if result_path.exists():
+                return trial_dir
+
+        return None
+
     def _get_results_output_dir(self, policy_model_name: str, dataset_alias: str, run_timestamp: datetime) -> Path:
         """Build immutable run output directory grouped by date/dataset/model."""
         date_key = run_timestamp.strftime("%Y%m%d")
         dataset_key = self._sanitize_path_component(dataset_alias)
         model_key = self._sanitize_path_component(self._extract_model_name(policy_model_name))
-        return Path.cwd() / "results" / "runs" / date_key / dataset_key / model_key
+        return self._gym_root() / "results" / "runs" / date_key / dataset_key / model_key
 
     def _get_jobs_output_dir(self, policy_model_name: str, dataset_alias: str, run_timestamp: datetime) -> Path:
         """Build Harbor jobs directory grouped by date/dataset/model."""
         date_key = run_timestamp.strftime("%Y%m%d")
         dataset_key = self._sanitize_path_component(dataset_alias)
         model_key = self._sanitize_path_component(self._extract_model_name(policy_model_name))
-        return Path(self.config.harbor_jobs_dir) / date_key / dataset_key / model_key
+        jobs_dir = Path(self.config.harbor_jobs_dir)
+        if not jobs_dir.is_absolute():
+            jobs_dir = self._gym_root() / jobs_dir
+        return jobs_dir / date_key / dataset_key / model_key
+
+    @staticmethod
+    def _gym_root() -> Path:
+        """Return the Gym repository root independent of the process cwd."""
+        return Path(__file__).resolve().parents[2]
 
     @staticmethod
     def _parse_instance_id(instance_id: str) -> tuple[str, str]:
