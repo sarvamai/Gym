@@ -23,12 +23,14 @@ Concurrency:
   datasets.) `--concurrency 1` (the default) preserves the old sequential
   behaviour for direct callers.
 
-Manifest merge / retry:
-  If `--manifest` already exists, tasks recorded as `status == "ok"` are skipped
-  and their records carried forward; only not-ok / new tasks are (re)built and
-  merged in. This is what makes the run_openswe_e2b.sh two-pass flow viable: a
-  fast parallel pass, then a sequential `--concurrency 1` retry that rebuilds
-  ONLY the failures instead of all N templates again.
+Skip already-built / manifest merge / retry:
+  Before building, the script lists the e2b server's templates once and SKIPS any
+  task whose alias is already `buildStatus == "ready"` (the alias is content-
+  addressed, so a ready alias is the same environment) — pass `--force-rebuild` to
+  rebuild anyway. Separately, if `--manifest` already exists, tasks recorded as
+  `status == "ok"` are carried forward. Together these make the run_openswe_e2b.sh
+  two-pass flow cheap: the parallel pass reuses ready templates and builds only the
+  missing ones; the reduced-concurrency retry pass then rebuilds ONLY the failures.
 
 This script must run inside the harbor_agent venv because it imports
 `harbor.environments.e2b` and the e2b SDK.
@@ -91,6 +93,13 @@ def parse_args() -> argparse.Namespace:
         "unique alias (singleton-per-template cancellation cannot fire across "
         "distinct tasks). Default 1 = sequential.",
     )
+    p.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Rebuild every template even if an identical alias is already 'ready' on "
+        "the e2b server. Default: skip already-ready aliases (the alias is content-"
+        "addressed, so a ready alias is the same environment already built).",
+    )
     return p.parse_args()
 
 
@@ -121,6 +130,28 @@ async def build_one(task_dir: Path, cpus: int, memory_mb: int) -> dict:
     )
     elapsed = time.time() - started
     return {"task": task_dir.name, "alias": alias, "elapsed_sec": elapsed}
+
+
+def fetch_ready_aliases() -> set[str]:
+    """Lowercased aliases whose latest build is 'ready' on the e2b server.
+
+    One `get_templates` call. Aliases are content-addressed, so a ready alias means
+    that exact environment is already built and can be reused without rebuilding.
+    e2b stores aliases lowercased, so callers must compare case-insensitively.
+    """
+    from e2b.api.client.api.templates import get_templates
+    from e2b.api.client_sync import get_api_client
+    from e2b.connection_config import ConnectionConfig
+
+    client = get_api_client(ConnectionConfig(), require_api_key=True, require_access_token=False)
+    items = get_templates.sync_detailed(client=client).parsed or []
+    ready: set[str] = set()
+    for t in items:
+        d = t.to_dict()
+        if str(d.get("buildStatus")).lower() == "ready":
+            for alias in d.get("aliases") or []:
+                ready.add(alias.lower())
+    return ready
 
 
 def _load_ok_tasks(manifest: Path) -> dict[str, dict]:
@@ -157,16 +188,37 @@ async def main_async(args: argparse.Namespace) -> int:
     if not task_dirs:
         raise SystemExit(f"No task dirs under {args.tasks_dir}")
 
-    # Carry forward already-ok records from a prior pass; only (re)build the rest.
-    # This makes the run_openswe_e2b.sh sequential retry pass rebuild ONLY failures.
+    # Carry forward already-ok records from a prior pass (local manifest); only
+    # (re)build the rest. This makes the run_openswe_e2b.sh retry pass redo failures.
     already_ok = _load_ok_tasks(args.manifest)
     todo = [d for d in task_dirs if d.name not in already_ok]
-    skipped = len(task_dirs) - len(todo)
+    carried = len(task_dirs) - len(todo)
+
+    # Skip tasks whose template alias is already 'ready' on the e2b server. The alias
+    # is content-addressed (env dir hash), so a ready alias is the SAME environment
+    # already built — reuse it instead of rebuilding every run.
+    skipped_ready: list[dict] = []
+    if not args.force_rebuild and todo:
+        try:
+            ready = fetch_ready_aliases()
+        except Exception as exc:
+            print(f"[warn] could not list server templates ({type(exc).__name__}: {exc}); building all", flush=True)
+            ready = set()
+        remaining = []
+        for d in todo:
+            alias = template_name_for(d)
+            if alias.lower() in ready:
+                skipped_ready.append({"task": d.name, "alias": alias, "status": "ok", "reused": "already_ready"})
+            else:
+                remaining.append(d)
+        if skipped_ready:
+            print(f"[skip] {len(skipped_ready)} templates already ready on server; reusing.", flush=True)
+        todo = remaining
 
     concurrency = max(1, args.concurrency)
     print(
-        f"Pre-warming {len(todo)}/{len(task_dirs)} templates "
-        f"(concurrency={concurrency}, {skipped} already ok carried forward).",
+        f"Pre-warming {len(todo)}/{len(task_dirs)} templates (concurrency={concurrency}; "
+        f"{carried} carried from manifest, {len(skipped_ready)} reused from server).",
         flush=True,
     )
 
@@ -176,7 +228,7 @@ async def main_async(args: argparse.Namespace) -> int:
         *(_build_with_sema(d, args, sema, f"[{i}/{n}]") for i, d in enumerate(todo, 1))
     )
 
-    by_task = {**already_ok, **{r["task"]: r for r in built}}
+    by_task = {**already_ok, **{r["task"]: r for r in skipped_ready}, **{r["task"]: r for r in built}}
     # Preserve the original task-dir ordering in the manifest.
     records = [by_task[d.name] for d in task_dirs]
 
