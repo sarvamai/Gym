@@ -66,7 +66,7 @@ def test_skips_ready_aliases(tmp_path, monkeypatch):
     rc = run_main(mod, tasks_dir, manifest)
 
     assert rc == 0
-    assert "task_a" not in built                 # reused from server, NOT rebuilt
+    assert "task_a" not in built  # reused from server, NOT rebuilt
     assert set(built) == {"task_b", "task_c"}
     recs = {r["task"]: r for r in json.loads(manifest.read_text())["records"]}
     assert recs["task_a"]["status"] == "ok"
@@ -98,7 +98,7 @@ def test_force_rebuild_ignores_server(tmp_path, monkeypatch):
     rc = run_main(mod, tasks_dir, manifest, force_rebuild=True)
 
     assert rc == 0
-    assert called["n"] == 0                       # --force-rebuild must NOT query the server
+    assert called["n"] == 0  # --force-rebuild must NOT query the server
     assert set(built) == {"task_a", "task_b"}
 
 
@@ -123,7 +123,7 @@ def test_server_list_failure_builds_all(tmp_path, monkeypatch):
     rc = run_main(mod, tasks_dir, manifest)
 
     assert rc == 0
-    assert set(built) == {"task_a", "task_b"}     # list failure → build all (safe fallback)
+    assert set(built) == {"task_a", "task_b"}  # list failure → build all (safe fallback)
 
 
 def test_carries_forward_manifest_and_skips_server(tmp_path, monkeypatch):
@@ -152,9 +152,9 @@ def test_carries_forward_manifest_and_skips_server(tmp_path, monkeypatch):
     rc = run_main(mod, tasks_dir, manifest)
 
     assert rc == 0
-    assert built == ["task_c"]                    # only the un-cached, un-ready task builds
+    assert built == ["task_c"]  # only the un-cached, un-ready task builds
     recs = {r["task"]: r for r in json.loads(manifest.read_text())["records"]}
     assert set(recs) == {"task_a", "task_b", "task_c"}
-    assert recs["task_a"]["status"] == "ok"       # carried from manifest
+    assert recs["task_a"]["status"] == "ok"  # carried from manifest
     assert recs["task_b"]["reused"] == "already_ready"
     assert recs["task_c"]["status"] == "ok"

@@ -47,6 +47,7 @@ from pathlib import Path
 from dirhash import dirhash
 from e2b import AsyncTemplate, Template
 
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TASKS_DIR = (
     REPO_ROOT
@@ -224,9 +225,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     sema = asyncio.Semaphore(concurrency)
     n = len(todo)
-    built = await asyncio.gather(
-        *(_build_with_sema(d, args, sema, f"[{i}/{n}]") for i, d in enumerate(todo, 1))
-    )
+    built = await asyncio.gather(*(_build_with_sema(d, args, sema, f"[{i}/{n}]") for i, d in enumerate(todo, 1)))
 
     by_task = {**already_ok, **{r["task"]: r for r in skipped_ready}, **{r["task"]: r for r in built}}
     # Preserve the original task-dir ordering in the manifest.
