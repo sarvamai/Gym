@@ -89,7 +89,12 @@ VERIFIER_ENV=(ANTHROPIC_API_KEY)
 # E2B prewarm knobs (only used when SANDBOX=e2b).
 PREWARM_CPUS=2
 PREWARM_MEMORY_MB=8192
-PREWARM_CONCURRENCY=20
+PREWARM_CONCURRENCY=20          # parallel first pass
+# Retry pass concurrency for templates that failed the first pass. Parallel is safe
+# (each task has a unique alias, so e2b's singleton-per-template cancel never fires
+# across tasks); kept below PREWARM_CONCURRENCY to be gentle on the build pool for
+# whatever transiently failed. Set to 1 for the old fully-sequential behaviour.
+PREWARM_RETRY_CONCURRENCY=6
 
 # ============================================================================
 # Repo root + env.
@@ -388,11 +393,11 @@ print(len([r for r in m["records"] if r.get("status") != "ok"]))
 PY
 )
   if [[ "$retry_needed" -gt 0 ]]; then
-    echo "[prewarm] sequential retry for $retry_needed failed templates ..."
+    echo "[prewarm] retry pass (concurrency=$PREWARM_RETRY_CONCURRENCY) for $retry_needed failed templates ..."
     "$HARBOR_PY" scripts/prewarm_openswe_oss_filtered_20.py \
       --tasks-dir "$STAGE_DIR" --manifest "$PREWARM_MANIFEST" \
       --cpus "$PREWARM_CPUS" --memory-mb "$PREWARM_MEMORY_MB" \
-      --concurrency 1 || true
+      --concurrency "$PREWARM_RETRY_CONCURRENCY" || true
   fi
 
   RUN_INPUT_JSONL="$RUN_INPUT_JSONL" PREWARM_MANIFEST="$PREWARM_MANIFEST" "$HARBOR_PY" - <<'PY'
