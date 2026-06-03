@@ -13,6 +13,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "prewarm_openswe_oss_filtered_20.py"
 
@@ -99,3 +100,61 @@ def test_force_rebuild_ignores_server(tmp_path, monkeypatch):
     assert rc == 0
     assert called["n"] == 0                       # --force-rebuild must NOT query the server
     assert set(built) == {"task_a", "task_b"}
+
+
+def test_server_list_failure_builds_all(tmp_path, monkeypatch):
+    mod = load_mod()
+    tasks_dir = make_tasks(tmp_path, ["task_a", "task_b"])
+    manifest = tmp_path / "m.json"
+
+    def boom():
+        raise RuntimeError("server down")
+
+    monkeypatch.setattr(mod, "fetch_ready_aliases", boom, raising=False)
+
+    built = []
+
+    async def fake_build_one(task_dir, cpus, memory_mb):
+        built.append(task_dir.name)
+        return {"task": task_dir.name, "alias": mod.template_name_for(task_dir), "elapsed_sec": 0.0}
+
+    monkeypatch.setattr(mod, "build_one", fake_build_one)
+
+    rc = run_main(mod, tasks_dir, manifest)
+
+    assert rc == 0
+    assert set(built) == {"task_a", "task_b"}     # list failure → build all (safe fallback)
+
+
+def test_carries_forward_manifest_and_skips_server(tmp_path, monkeypatch):
+    mod = load_mod()
+    tasks_dir = make_tasks(tmp_path, ["task_a", "task_b", "task_c"])
+    manifest = tmp_path / "m.json"
+    # Seed a prior manifest: task_a already ok -> must be carried forward, not rebuilt.
+    manifest.write_text(
+        json.dumps(
+            {"records": [{"task": "task_a", "alias": mod.template_name_for(tasks_dir / "task_a"), "status": "ok"}]}
+        )
+    )
+
+    # Server reports task_b's alias ready -> must be reused, not rebuilt.
+    ready_b = mod.template_name_for(tasks_dir / "task_b").lower()
+    monkeypatch.setattr(mod, "fetch_ready_aliases", lambda: {ready_b}, raising=False)
+
+    built = []
+
+    async def fake_build_one(task_dir, cpus, memory_mb):
+        built.append(task_dir.name)
+        return {"task": task_dir.name, "alias": mod.template_name_for(task_dir), "elapsed_sec": 0.0}
+
+    monkeypatch.setattr(mod, "build_one", fake_build_one)
+
+    rc = run_main(mod, tasks_dir, manifest)
+
+    assert rc == 0
+    assert built == ["task_c"]                    # only the un-cached, un-ready task builds
+    recs = {r["task"]: r for r in json.loads(manifest.read_text())["records"]}
+    assert set(recs) == {"task_a", "task_b", "task_c"}
+    assert recs["task_a"]["status"] == "ok"       # carried from manifest
+    assert recs["task_b"]["reused"] == "already_ready"
+    assert recs["task_c"]["status"] == "ok"
